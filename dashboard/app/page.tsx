@@ -4,7 +4,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import Image from 'next/image';
 
 /* ── Types ── */
-type StageId = 'drive_extract' | 'llm_analysis' | 'report_service';
+type StageId = 'drive_extract' | 'llm_analysis' | 'report_service' | 'email';
 type StageStatus = 'pending' | 'running' | 'completed' | 'error';
 
 interface PipelineEvent {
@@ -67,6 +67,7 @@ export default function HomePage() {
     drive_extract: { status: 'pending', log: 'Waiting...' },
     llm_analysis: { status: 'pending', log: 'Waiting...' },
     report_service: { status: 'pending', log: 'Waiting...' },
+    email: { status: 'pending', log: 'Waiting...' },
   });
   const [pipelineOpen, setPipelineOpen] = useState(false);
   const [pipelineMsg, setPipelineMsg] = useState('Ready to start...');
@@ -108,8 +109,8 @@ export default function HomePage() {
       .catch(() => {});
   }, []);
 
-  /* ── Run Pipeline ── */
-  const runPipeline = useCallback(async () => {
+  /* ── Run Pipeline + Email (Go button) ── */
+  const runAndEmail = useCallback(async () => {
     setLoading(true);
     setPipelineOpen(true);
     setPipelineState('idle');
@@ -118,6 +119,99 @@ export default function HomePage() {
       drive_extract: { status: 'pending', log: 'Waiting...' },
       llm_analysis: { status: 'pending', log: 'Waiting...' },
       report_service: { status: 'pending', log: 'Waiting...' },
+      email: { status: 'pending', log: 'Waiting...' },
+    });
+
+    try {
+      const res = await fetch('/api/run-and-email', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          recipients: settings.recipients,
+          subject: settings.subject,
+          body_line: settings.body_line,
+        }),
+      });
+      const reader = res.body?.getReader();
+      const decoder = new TextDecoder();
+      let buf = '';
+
+      while (reader) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        const lines = buf.split('\n');
+        buf = lines.pop() ?? '';
+
+        for (const line of lines) {
+          if (!line.trim() || !line.startsWith('data: ')) continue;
+          const dataStr = line.slice(6);
+          if (!dataStr) continue;
+          try {
+            const data: PipelineEvent = JSON.parse(dataStr);
+            if (data.stage === 'pipeline') {
+              if (data.status === 'success') {
+                setPipelineState('success');
+                setPipelineMsg('Report generated successfully!');
+                setHtml(data.html ?? '');
+                setStatus({ text: 'Report generated successfully', type: 'ok' });
+                setSettings(prev => ({ ...prev, last_run: new Date().toISOString() }));
+              } else {
+                setPipelineState('error');
+                setPipelineMsg(`Failed: ${data.message || 'Unknown error'}`);
+                setStatus({ text: `Pipeline failed: ${data.message || ''}`, type: 'err' });
+              }
+            } else if (data.stage === 'email') {
+              const sid = data.stage as StageId;
+              setStages(prev => ({
+                ...prev,
+                [sid]: { status: data.status as StageStatus, log: data.message || '' },
+              }));
+              if (data.status === 'success') {
+                setPipelineMsg('Email sent successfully!');
+                setStatus({ text: 'Email sent successfully', type: 'ok' });
+                setTimeout(() => setPipelineOpen(false), 3000);
+              } else if (data.status === 'failed') {
+                setPipelineState('error');
+                setPipelineMsg(`Email failed: ${data.message || ''}`);
+                setStatus({ text: `Email failed: ${data.message || ''}`, type: 'err' });
+                // Keep overlay open so user sees the error
+              } else {
+                setPipelineMsg(`Email: ${data.message || 'Running...'}`);
+              }
+            } else {
+              const sid = data.stage as StageId;
+              setStages(prev => ({
+                ...prev,
+                [sid]: { status: data.status as StageStatus, log: data.message || '' },
+              }));
+              setPipelineMsg(`${sid}: ${data.message || 'Running...'}`);
+            }
+          } catch {
+            // ignore parse errors
+          }
+        }
+      }
+    } catch (err: any) {
+      setPipelineState('error');
+      setPipelineMsg(err?.message?.includes('Failed to fetch') ? 'Backend not running' : `Error: ${err.message}`);
+      setStatus({ text: 'Backend not running or unreachable', type: 'err' });
+    } finally {
+      setLoading(false);
+    }
+  }, [settings]);
+
+  /* ── Run Pipeline Only (no email) ── */
+  const runPipelineOnly = useCallback(async () => {
+    setLoading(true);
+    setPipelineOpen(true);
+    setPipelineState('idle');
+    setPipelineMsg('Starting pipeline...');
+    setStages({
+      drive_extract: { status: 'pending', log: 'Waiting...' },
+      llm_analysis: { status: 'pending', log: 'Waiting...' },
+      report_service: { status: 'pending', log: 'Waiting...' },
+      email: { status: 'pending', log: 'Skipped — report only mode' },
     });
 
     try {
@@ -177,8 +271,6 @@ export default function HomePage() {
       setLoading(false);
     }
   }, []);
-
-  /* ── Send Email ── */
   const sendEmail = useCallback(async () => {
     if (!settings.recipients.length) {
       setStatus({ text: 'No recipients selected', type: 'err' });
@@ -217,7 +309,7 @@ export default function HomePage() {
         body: JSON.stringify(settings),
       });
       const data = await res.json();
-      if (data) setSettings(prev => ({ ...prev, ...data }));
+      if (data.settings) setSettings(prev => ({ ...prev, ...data.settings }));
       setShowSettings(false);
       setStatus({ text: 'Settings saved', type: 'ok' });
     } catch (err: any) {
@@ -271,42 +363,14 @@ export default function HomePage() {
           <span className="text-sm font-medium text-white/80 hidden sm:inline">Report Dashboard</span>
         </div>
         <div className="flex items-center gap-3">
-          {settings.active ? (
-            <button
-              className="inline-flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-semibold transition bg-danger text-white hover:brightness-110 shadow-md"
-              onClick={async () => {
-                const updated = { ...settings, active: false };
-                setSettings(updated);
-                await fetch('/api/settings', {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify(updated),
-                });
-                setStatus({ text: 'Automation stopped', type: 'ok' });
-              }}
-            >
-              ⏹ Stop Automation
-            </button>
-          ) : (
-            <button
-              className="inline-flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-semibold transition bg-gradient-to-r from-indigo to-purple text-white hover:brightness-110 shadow-md"
-              onClick={async () => {
-                const updated = { ...settings, active: true };
-                setSettings(updated);
-                await fetch('/api/settings', {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify(updated),
-                });
-                setStatus({ text: 'Automation initiated', type: 'ok' });
-              }}
-            >
-              ▶ Go (Start Automation)
-            </button>
-          )}
+          {/* GO button - runs pipeline AND sends email */}
           <button
-            className={`inline-flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-semibold bg-white/10 hover:bg-white/20 text-white transition ${loading ? 'opacity-50 cursor-not-allowed' : ''}`}
-            onClick={() => { if (!loading) runPipeline(); }}
+            className={`inline-flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-semibold transition ${
+              loading
+                ? 'bg-white/10 text-white/50 cursor-not-allowed'
+                : 'bg-gradient-to-r from-indigo to-purple text-white hover:brightness-110 shadow-md'
+            }`}
+            onClick={() => { if (!loading) runAndEmail(); }}
             disabled={loading}
           >
             {loading ? (
@@ -314,9 +378,28 @@ export default function HomePage() {
                 <span className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
                 Running…
               </>
-            ) : 'Generate Report Once'}
+            ) : (
+              <>
+                ▶ Go (Run Pipeline + Send Email)
+              </>
+            )}
           </button>
 
+          {/* Generate Report Once — pipeline only, no email */}
+          <button
+            className={`inline-flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-semibold bg-white/10 hover:bg-white/20 text-white transition ${loading ? 'opacity-50 cursor-not-allowed' : ''}`}
+            onClick={() => { if (!loading) runPipelineOnly(); }}
+            disabled={loading}
+          >
+            {loading ? (
+              <>
+                <span className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                Running…
+              </>
+            ) : 'Generate Report Only'}
+          </button>
+
+          {/* Send Email only */}
           <button
             className={`inline-flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-semibold transition ${
               settings.recipients.length && !emailSending
@@ -384,8 +467,8 @@ export default function HomePage() {
                 />
               ) : (
                 <div className="absolute inset-0 flex flex-col items-center justify-center text-slate text-sm gap-2">
-                  <p>Click <span className="font-semibold text-indigo">Generate Report Once</span> or <span className="font-semibold text-indigo">Go</span> to run the pipeline:</p>
-                  <p className="text-xs opacity-70">Extract data → LLM Analysis → Generate HTML Report</p>
+                  <p>Click <span className="font-semibold text-indigo">Go</span> to run the pipeline and send email:</p>
+                  <p className="text-xs opacity-70">Extract data → LLM Analysis → Generate HTML → PDF → Email</p>
                 </div>
               )
             ) : (
@@ -410,6 +493,7 @@ export default function HomePage() {
                   { id: 'drive_extract' as StageId, num: 1, name: 'Fetch Excel from Google Drive', desc: 'Download and extract all sheet data' },
                   { id: 'llm_analysis' as StageId, num: 2, name: 'LLM Analysis', desc: 'Send data to Ollama for workforce audit' },
                   { id: 'report_service' as StageId, num: 3, name: 'Generate HTML Report', desc: 'Render the final workforce report from template' },
+                  { id: 'email' as StageId, num: 4, name: 'Send Email', desc: 'Generate PDF and email to selected recipients' },
                 ]).map(s => {
                   const st = stages[s.id];
                   return (

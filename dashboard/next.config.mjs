@@ -2,6 +2,12 @@
 const nextConfig = {
   reactStrictMode: true,
   async rewrites() {
+    // In production (Vercel), /api/* is handled by the Python serverless function.
+    // In local dev, we proxy to the local FastAPI backend.
+    const isDev = process.env.NODE_ENV === 'development';
+    if (!isDev) {
+      return [];
+    }
     return [
       {
         source: '/api/:path*',

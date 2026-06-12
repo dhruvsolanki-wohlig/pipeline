@@ -5,7 +5,8 @@ from pathlib import Path
 from datetime import datetime
 from typing import List, Optional
 
-SETTINGS_FILE = Path(__file__).resolve().parent / "schedule_settings.json"
+import tempfile
+SETTINGS_FILE = Path(tempfile.gettempdir() if os.environ.get("VERCEL") else str(Path(__file__).resolve().parent)) / "schedule_settings.json"
 
 DEFAULT_SETTINGS = {
     "recipients": ["chintan@wohlig.com", "jagruti@wohlig.com", "chirag@wohlig.com"],
